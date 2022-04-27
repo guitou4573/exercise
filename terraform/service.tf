@@ -1,14 +1,3 @@
-# Network interface for the VM hosting our service
-resource "aws_network_interface" "vm_iface" {
-  subnet_id   = module.exercise_vpc.private_subnets[0]
-  private_ips = ["10.0.1.10"]
-  security_groups = [aws_security_group.service_sg.id]
-
-  tags = {
-    Name = "primary_network_interface"
-  }
-}
-
 # Setting up VM to host our service
 # source: https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance
 
@@ -28,17 +17,25 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"] # Canonical
 }
 
-resource "aws_instance" "vm_server" {
-  ami           = data.aws_ami.ubuntu.id
-  instance_type = "t2.micro"
-
-  network_interface {
-    network_interface_id = aws_network_interface.vm_iface.id
-    device_index         = 0
-  }
-
+resource "aws_launch_configuration" "exercise_conf" {
+  name          = "exercise-conf"
+  image_id      = data.aws_ami.ubuntu.id
+  instance_type = "t2.nano"
   # user data installs node exporter on the instance, listening on port 9100 by default
   user_data = file("data/init.sh")
+  security_groups = [aws_security_group.service_sg.id]
+}
+
+resource "aws_autoscaling_group" "exercise_asg" {
+  name                      = "exercise-asg"
+  max_size                  = 1
+  min_size                  = 0
+  health_check_grace_period = 300
+  health_check_type         = "ELB"
+  desired_capacity          = 1
+  force_delete              = true
+  launch_configuration      = aws_launch_configuration.exercise_conf.name
+  vpc_zone_identifier       = module.exercise_vpc.private_subnets
 }
 
 resource "aws_security_group" "service_sg" {
@@ -50,13 +47,22 @@ resource "aws_security_group" "service_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  vpc_id = module.exercise_vpc.vpc_id
+
   lifecycle {
     create_before_destroy = true
   }
 }
 
-resource "aws_security_group" "elb_sg" {
-  name = "security_group_for_elb"
+resource "aws_security_group" "lb_sg" {
+  name = "security_group_for_lb"
   ingress {
     from_port   = 80
     to_port     = 80
@@ -70,38 +76,49 @@ resource "aws_security_group" "elb_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+  
+  vpc_id = module.exercise_vpc.vpc_id
 
   lifecycle {
     create_before_destroy = true
   }
 }
 
-resource "aws_elb" "service_elb" {
-  name               = "service-elb"
-  availability_zones = var.availability_zones
-  security_groups    = [aws_security_group.elb_sg.id]
+resource "aws_lb" "service_lb" {
+  name               = "service-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.lb_sg.id]
+  subnets            = module.exercise_vpc.private_subnets
 
-  listener {
-    instance_port     = 9100
-    instance_protocol = "http"
-    lb_port           = 80
-    lb_protocol       = "http"
-  }
-  health_check {
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    timeout             = 3
-    target              = "HTTP:9100/"
-    interval            = 30
-  }
+  enable_deletion_protection = true
 
-  instances                   = [aws_instance.vm_server.id]
-  cross_zone_load_balancing   = true
-  idle_timeout                = 400
-  connection_draining         = true
-  connection_draining_timeout = 400
+}
+
+resource "aws_alb_target_group" "service_tg" {
+  name     = "service-lb-tg"
+  port     = 9100
+  protocol = "HTTP"
+  vpc_id   = module.exercise_vpc.vpc_id
+}
+
+
+resource "aws_lb_listener" "service_listener" {
+  load_balancer_arn = aws_lb.service_lb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_alb_target_group.service_tg.arn
+  }
+}
+
+resource "aws_autoscaling_attachment" "asg_attachment_bar" {
+  autoscaling_group_name = aws_autoscaling_group.exercise_asg.id
+  alb_target_group_arn   = aws_alb_target_group.service_tg.arn
 }
 
 output "elb-dns" {
-  value = aws_elb.service_elb.dns_name
+  value = aws_lb.service_lb.dns_name
 }
